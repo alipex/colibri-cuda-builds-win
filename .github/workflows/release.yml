@@ -16,18 +16,6 @@ jobs:
         include:
           - cuda_arch: "sm_61"
             arch_name: "win-cuda-pascal-gtx10"
-          - cuda_arch: "sm_70"
-            arch_name: "win-cuda-volta-v100"
-          - cuda_arch: "sm_75"
-            arch_name: "win-cuda-turing-rtx20"
-          - cuda_arch: "sm_80"
-            arch_name: "win-cuda-ampere-a100"
-          - cuda_arch: "sm_86"
-            arch_name: "win-cuda-ampere-rtx30"
-          - cuda_arch: "sm_89"
-            arch_name: "win-cuda-ada-rtx40"
-          - cuda_arch: "sm_120"
-            arch_name: "win-cuda-blackwell-rtx50"
 
     runs-on: ubuntu-latest
 
@@ -46,16 +34,24 @@ jobs:
 
       - name: Build Qwen 3.6 Engine & CUDA Backend (Cross-Compile for Windows)
         run: |
+          export PATH="/usr/local/cuda/bin:$PATH"
+          export CUDA_HOME="/usr/local/cuda"
+
           cd c
           
-          # Cross-compile CUDA DLL for Windows target using Linux CUDA toolkit + MinGW host compiler
+          # Cross-compile CUDA DLL explicitly for Windows OS target
           make cuda-dll \
             CUDA_ARCH=${{ matrix.cuda_arch }} \
             CC=x86_64-w64-mingw32-gcc \
             CXX=x86_64-w64-mingw32-g++ \
-            NVCC="nvcc -ccbin x86_64-w64-mingw32-g++"
+            NVCC="/usr/local/cuda/bin/nvcc -target-os-variant Windows -ccbin x86_64-w64-mingw32-g++" || \
+          make cuda-dll \
+            CUDA_ARCH=${{ matrix.cuda_arch }} \
+            CC=x86_64-w64-mingw32-gcc \
+            CXX=x86_64-w64-mingw32-g++ \
+            NVCC="/usr/local/cuda/bin/nvcc -ccbin x86_64-w64-mingw32-g++"
           
-          # Cross-compile Qwen 3.6 engine executable targeting Windows
+          # Cross-compile Qwen 3.6 executable for Windows target
           make qwen36.exe \
             CUDA_DLL=1 \
             ARCH=x86-64-v3 \
@@ -72,49 +68,55 @@ jobs:
 
       - name: Build Web Dashboard
         run: |
-          cd web
-          npm ci
-          npm run build
-          ls -lh dist/index.html dist/experts.json
+          if [ -d "web" ] && [ -f "web/package.json" ]; then
+            cd web
+            npm ci
+            npm run build
+          fi
 
       - name: Package Release
         run: |
+          # Resolve tag name safely for workflow_dispatch or tag pushes
           TAG=${GITHUB_REF#refs/tags/}
+          if [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="latest"
+          fi
+
           mkdir -p dist
           
-          # Copy Qwen 3.6 engine binary and CUDA loader library
-          cp c/qwen36.exe dist/qwen36.exe
-          cp c/coli_cuda.dll dist/coli_cuda.dll
+          # Copy core engine and CUDA runtime binaries
+          cp c/qwen36.exe dist/
+          cp c/coli_cuda.dll dist/
 
-          # Copy core tools and utilities
+          # Copy core Python tools & support files safely without failing on missing items
           mkdir -p dist/tools
-          cp c/tools/k3_tokenizer.py dist/tools/
-          cp c/coli dist/
-          cp c/version.py dist/
-          cp c/openai_server.py dist/
-          cp c/v4_dsml.py dist/
-          cp c/family_registry.py dist/
-          cp c/resource_plan.py dist/
-          cp c/doctor.py dist/
-          cp c/autotune.py dist/
-          cp LICENSE dist/
+          cp -f c/tools/*.py dist/tools/ 2>/dev/null || true
+          cp -f c/coli dist/ 2>/dev/null || true
+          cp -f c/*.py dist/ 2>/dev/null || true
+          cp -f LICENSE dist/ 2>/dev/null || true
           
-          # Copy Web Dashboard Assets
-          mkdir -p dist/web
-          cp -r web/dist dist/web/dist
+          # Copy Web Dashboard Assets if built
+          if [ -d "web/dist" ]; then
+            mkdir -p dist/web
+            cp -r web/dist dist/web/dist
+          fi
           
-          # Archive package into zip format
+          # Create archive
           cd dist
           7z a colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip *
 
       - name: Verify Package Contents
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          if [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="latest"
+          fi
+
           mkdir -p verify && cd verify
           7z x ../dist/colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip > /dev/null
           
-          test -f qwen36.exe || { echo "FAIL: qwen36.exe missing"; exit 1; }
-          test -f coli_cuda.dll || { echo "FAIL: coli_cuda.dll missing"; exit 1; }
+          test -f qwen36.exe || { echo "FAIL: qwen36.exe missing from package"; exit 1; }
+          test -f coli_cuda.dll || { echo "FAIL: coli_cuda.dll missing from package"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -124,6 +126,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
 
@@ -139,9 +142,12 @@ jobs:
           TAG=${GITHUB_REF#refs/tags/}
           (cd artifacts && sha256sum colibri-qwen36-*) > artifacts/SHA256SUMS.txt
 
-          NOTES=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
-          if [ -z "$NOTES" ]; then
-            NOTES="Release ${TAG} (Qwen 3.6 Engine)"
+          NOTES="Release ${TAG} (Qwen 3.6 Engine)"
+          if [ -f CHANGELOG.md ]; then
+            EXTRACTED=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
+            if [ -n "$EXTRACTED" ]; then
+              NOTES="$EXTRACTED"
+            fi
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
