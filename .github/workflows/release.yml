@@ -29,45 +29,40 @@ jobs:
           - cuda_arch: "sm_120"
             arch_name: "win-cuda-blackwell-rtx50"
 
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSVC (Host Compiler for nvcc)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      - name: Install MinGW-w64 Cross Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 p7zip-full
 
       - name: Install CUDA Toolkit 12.8
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.8.0'
 
-      - name: Setup w64devkit
-        shell: powershell
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/skeeto/w64devkit/releases/download/v2.0.0/w64devkit-2.0.0.zip" -OutFile "w64devkit.zip"
-          Expand-Archive -Path "w64devkit.zip" -DestinationPath "C:\"
-          echo "C:\w64devkit\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Build CUDA Backend & Engines
-        shell: cmd
+      - name: Build Qwen 3.6 Engine & CUDA Backend (Cross-Compile for Windows)
         run: |
           cd c
           
-          :: Build CUDA DLL overriding nvcc host compiler version check
-          make cuda-dll CUDA_ARCH=${{ matrix.cuda_arch }} NVCC="nvcc -allow-unsupported-compiler"
+          # Cross-compile CUDA DLL for Windows target using Linux CUDA toolkit + MinGW host compiler
+          make cuda-dll \
+            CUDA_ARCH=${{ matrix.cuda_arch }} \
+            CC=x86_64-w64-mingw32-gcc \
+            CXX=x86_64-w64-mingw32-g++ \
+            NVCC="nvcc -ccbin x86_64-w64-mingw32-g++"
           
-          :: Build engines linked with CUDA loader
-          for %%t in (colibri inkling kimi_k3 olmoe qwen36) do (
-            make %%t.exe CUDA_DLL=1 ARCH=x86-64-v3
-          )
+          # Cross-compile Qwen 3.6 engine executable targeting Windows
+          make qwen36.exe \
+            CUDA_DLL=1 \
+            ARCH=x86-64-v3 \
+            CC=x86_64-w64-mingw32-gcc \
+            CXX=x86_64-w64-mingw32-g++
           
-          :: Build DeepSeek V4 engine
-          make deepseek-v4 CUDA_DLL=1 ARCH=x86-64-v3
-          
-          dir *.exe coli_cuda.dll
+          ls -lh qwen36.exe coli_cuda.dll
 
       - uses: actions/setup-node@v4
         with:
@@ -75,28 +70,23 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Build web dashboard
-        shell: bash
+      - name: Build Web Dashboard
         run: |
           cd web
           npm ci
           npm run build
           ls -lh dist/index.html dist/experts.json
 
-      - name: Package
-        shell: bash
+      - name: Package Release
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p dist
           
-          cp c/colibri.exe dist/colibri.exe
-          cp c/inkling.exe dist/inkling.exe
-          cp c/kimi_k3.exe dist/kimi_k3.exe
-          cp c/olmoe.exe dist/olmoe.exe
+          # Copy Qwen 3.6 engine binary and CUDA loader library
           cp c/qwen36.exe dist/qwen36.exe
-          cp c/deepseek_v4.exe dist/deepseek_v4.exe
           cp c/coli_cuda.dll dist/coli_cuda.dll
 
+          # Copy core tools and utilities
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
           cp c/coli dist/
@@ -109,31 +99,27 @@ jobs:
           cp c/autotune.py dist/
           cp LICENSE dist/
           
+          # Copy Web Dashboard Assets
           mkdir -p dist/web
           cp -r web/dist dist/web/dist
           
+          # Archive package into zip format
           cd dist
-          7z a colibri-${TAG}-${{ matrix.arch_name }}.zip *
+          7z a colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip *
 
-      - name: Verify Package
-        shell: bash
+      - name: Verify Package Contents
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p verify && cd verify
-          7z x ../dist/colibri-${TAG}-${{ matrix.arch_name }}.zip > /dev/null
+          7z x ../dist/colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip > /dev/null
           
-          test -x colibri.exe || { echo "engine missing"; exit 1; }
+          test -f qwen36.exe || { echo "FAIL: qwen36.exe missing"; exit 1; }
           test -f coli_cuda.dll || { echo "FAIL: coli_cuda.dll missing"; exit 1; }
-
-          SIBLINGS="inkling kimi_k3 olmoe qwen36 deepseek_v4"
-          for e in $SIBLINGS; do
-            test -x $e.exe || { echo "FAIL: $e missing"; exit 1; }
-          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: colibri-${{ matrix.arch_name }}
-          path: dist/colibri-*.zip
+          name: colibri-qwen36-${{ matrix.arch_name }}
+          path: dist/colibri-qwen36-*.zip
 
   release:
     needs: build
@@ -151,17 +137,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          (cd artifacts && sha256sum colibri-*) > artifacts/SHA256SUMS.txt
+          (cd artifacts && sha256sum colibri-qwen36-*) > artifacts/SHA256SUMS.txt
 
           NOTES=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
           if [ -z "$NOTES" ]; then
-            NOTES="Release ${TAG}"
+            NOTES="Release ${TAG} (Qwen 3.6 Engine)"
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/* --clobber
           else
             gh release create "$TAG" artifacts/* \
-              --title "colibri ${TAG}" \
+              --title "colibri ${TAG} (Qwen 3.6 Engine)" \
               --notes "$NOTES"
           fi
