@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
   push:
     tags: ['v*']
 
