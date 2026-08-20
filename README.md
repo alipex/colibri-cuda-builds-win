@@ -1,3 +1,6 @@
+> [!NOTE]
+> This is not the main repository, this is a fork for distribution of CUDA-enabled Windows builds. See the Releases tab to run.
+
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
