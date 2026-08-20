@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false  # Prevents one failed architecture from canceling the rest
       matrix:
         include:
           - cuda_arch: "sm_61"
@@ -41,33 +42,39 @@ jobs:
         with:
           arch: x64
 
-      - name: Install CUDA Toolkit 12.8 (NVIDIA Mirror)
+      - name: Install CUDA Toolkit 12.8
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.8.0'
 
-      - uses: msys2/setup-msys2@v2
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: false
           path-type: inherit
+          # Cache settings fixed: isolate keys per architecture to prevent HTTP 400 & collisions
+          cache: true
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
 
-      - name: Build CUDA DLL & Engines
+      - name: Build CUDA Backend & Engines
         run: |
+          # 1. Ensure POSIX binaries (sh.exe, printf) are explicitly on PATH for Makefile
+          export PATH="/usr/bin:/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin:$PATH"
+          
           cd c
           
-          # 1. Build target-specific CUDA backend DLL
+          # 2. Build CUDA DLL
           make cuda-dll CUDA_ARCH=${{ matrix.cuda_arch }}
           
-          # 2. Build engines linked with CUDA dynamic loader
+          # 3. Build engines linked with CUDA loader
           for t in colibri inkling kimi_k3 olmoe qwen36; do
             make $t.exe CUDA_DLL=1 ARCH=x86-64-v3
           done
           
-          # 3. Build DeepSeek V4 engine
+          # 4. Build DeepSeek V4 engine
           make deepseek-v4 CUDA_DLL=1 ARCH=x86-64-v3
           
           ls -lh *.exe coli_cuda.dll
@@ -91,7 +98,6 @@ jobs:
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p dist
           
-          # Executables & CUDA DLL
           cp c/colibri.exe dist/colibri.exe
           cp c/inkling.exe dist/inkling.exe
           cp c/kimi_k3.exe dist/kimi_k3.exe
@@ -100,7 +106,6 @@ jobs:
           cp c/deepseek_v4.exe dist/deepseek_v4.exe
           cp c/coli_cuda.dll dist/coli_cuda.dll
 
-          # Python scripts, tools & web UI
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
           cp c/coli dist/
