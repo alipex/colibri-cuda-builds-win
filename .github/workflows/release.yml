@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
-      fail-fast: false  # Prevents one failed architecture from canceling the rest
+      fail-fast: false
       matrix:
         include:
           - cuda_arch: "sm_61"
@@ -30,9 +30,6 @@ jobs:
             arch_name: "win-cuda-blackwell-rtx50"
 
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
 
     steps:
       - uses: actions/checkout@v4
@@ -41,43 +38,37 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          toolset: '14.38'
 
       - name: Install CUDA Toolkit 12.8
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.8.0'
 
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: false
-          path-type: inherit
-          # Cache settings fixed: isolate keys per architecture to prevent HTTP 400 & collisions
-          cache: true
-          install: >-
-            make
-            mingw-w64-ucrt-x86_64-gcc
+      - name: Setup w64devkit
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/skeeto/w64devkit/releases/download/v2.0.0/w64devkit-2.0.0.zip" -OutFile "w64devkit.zip"
+          Expand-Archive -Path "w64devkit.zip" -DestinationPath "C:\"
+          echo "C:\w64devkit\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build CUDA Backend & Engines
+        shell: cmd
         run: |
-          # 1. Ensure POSIX binaries (sh.exe, printf) are explicitly on PATH for Makefile
-          export PATH="/usr/bin:/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin:$PATH"
-          
           cd c
           
-          # 2. Build CUDA DLL
-          make cuda-dll CUDA_ARCH=${{ matrix.cuda_arch }}
+          :: Build CUDA DLL with flag override for host compiler
+          make cuda-dll CUDA_ARCH=${{ matrix.cuda_arch }} NVCC="nvcc -allow-unsupported-compiler"
           
-          # 3. Build engines linked with CUDA loader
-          for t in colibri inkling kimi_k3 olmoe qwen36; do
-            make $t.exe CUDA_DLL=1 ARCH=x86-64-v3
-          done
+          :: Build engines linked with CUDA loader
+          for %%t in (colibri inkling kimi_k3 olmoe qwen36) do (
+            make %%t.exe CUDA_DLL=1 ARCH=x86-64-v3
+          )
           
-          # 4. Build DeepSeek V4 engine
+          :: Build DeepSeek V4 engine
           make deepseek-v4 CUDA_DLL=1 ARCH=x86-64-v3
           
-          ls -lh *.exe coli_cuda.dll
+          dir *.exe coli_cuda.dll
 
       - uses: actions/setup-node@v4
         with:
@@ -94,6 +85,7 @@ jobs:
           ls -lh dist/index.html dist/experts.json
 
       - name: Package
+        shell: bash
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p dist
@@ -125,6 +117,7 @@ jobs:
           7z a colibri-${TAG}-${{ matrix.arch_name }}.zip *
 
       - name: Verify Package
+        shell: bash
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           mkdir -p verify && cd verify
