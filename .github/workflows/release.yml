@@ -17,143 +17,398 @@ jobs:
           - cuda_arch: "sm_61"
             arch_name: "win-cuda-pascal-gtx10"
 
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 Cross Compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mingw-w64 p7zip-full
-
-      - name: Install CUDA Toolkit 12.8
-        uses: Jimver/cuda-toolkit@v0.2.21
+      # ------------------------------------------------------------
+      # MSYS2 / MinGW
+      # ------------------------------------------------------------
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
         with:
-          cuda: '12.8.0'
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gcc-libs
 
-      - name: Build Qwen 3.6 Engine & CUDA Backend (Cross-Compile for Windows)
+      - name: Add MSYS2 to PATH
+        shell: pwsh
         run: |
-          export PATH="/usr/local/cuda/bin:$PATH"
-          export CUDA_HOME="/usr/local/cuda"
+          "C:\msys64\usr\bin" >> $env:GITHUB_PATH
+          "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
 
-          cd c
-          
-          # Cross-compile CUDA DLL explicitly for Windows OS target
-          make cuda-dll \
-            CUDA_ARCH=${{ matrix.cuda_arch }} \
-            CC=x86_64-w64-mingw32-gcc \
-            CXX=x86_64-w64-mingw32-g++ \
-            NVCC="/usr/local/cuda/bin/nvcc -target-os-variant Windows -ccbin x86_64-w64-mingw32-g++" || \
-          make cuda-dll \
-            CUDA_ARCH=${{ matrix.cuda_arch }} \
-            CC=x86_64-w64-mingw32-gcc \
-            CXX=x86_64-w64-mingw32-g++ \
-            NVCC="/usr/local/cuda/bin/nvcc -ccbin x86_64-w64-mingw32-g++"
-          
-          # Cross-compile Qwen 3.6 executable for Windows target
-          make qwen36.exe \
-            CUDA_DLL=1 \
-            ARCH=x86-64-v3 \
-            CC=x86_64-w64-mingw32-gcc \
-            CXX=x86_64-w64-mingw32-g++
-          
-          ls -lh qwen36.exe coli_cuda.dll
+      # ------------------------------------------------------------
+      # CUDA 12.4
+      # ------------------------------------------------------------
+      - name: Install CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.4.1'
 
-      - uses: actions/setup-node@v4
+      # ------------------------------------------------------------
+      # Visual Studio 2022
+      #
+      # CUDA 12.4 needs the VS 2022/MSVC 193x toolchain.
+      # ------------------------------------------------------------
+      - name: Find Visual Studio 2022
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $vsPath = & $vswhere `
+            -version "[17.0,18.0)" `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio 2022 with MSVC C++ tools was not found."
+          }
+
+          "VS_PATH=$vsPath" >> $env:GITHUB_ENV
+
+          Write-Host "Visual Studio 2022 found at:"
+          Write-Host $vsPath
+
+      # ------------------------------------------------------------
+      # Verify toolchain
+      # ------------------------------------------------------------
+      - name: Verify build toolchain
+        shell: cmd
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          echo ===== MSVC =====
+          where cl
+          cl
+
+          echo ===== CUDA =====
+          where nvcc
+          nvcc --version
+
+          echo ===== MSYS2 =====
+          where make
+          where sh
+          where gcc
+
+          make --version
+          gcc --version
+
+      # ------------------------------------------------------------
+      # Build CUDA backend
+      # ------------------------------------------------------------
+      - name: Build CUDA DLL
+        shell: cmd
+        working-directory: c
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          make cuda-dll CUDA-ARCH=${{ matrix.cuda_arch }}
+
+      # ------------------------------------------------------------
+      # Build Windows executable
+      # ------------------------------------------------------------
+      - name: Build Colibri
+        shell: cmd
+        working-directory: c
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          make colibri.exe CUDA_DLL=1 ARCH=native
+
+      # ------------------------------------------------------------
+      # Build IO benchmark
+      # ------------------------------------------------------------
+      - name: Build IO benchmark
+        shell: cmd
+        working-directory: c
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          make iobench.exe
+
+      # ------------------------------------------------------------
+      # Verify native build artifacts
+      # ------------------------------------------------------------
+      - name: Verify build artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            "c\colibri.exe",
+            "c\coli_cuda.dll",
+            "c\iobench.exe"
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "FAIL: Missing build artifact: $file"
+            }
+
+            $size = (Get-Item $file).Length
+
+            if ($size -le 0) {
+              throw "FAIL: Empty build artifact: $file"
+            }
+
+            Write-Host "OK: $file ($size bytes)"
+          }
+
+      # ------------------------------------------------------------
+      # Node / Web Dashboard
+      # ------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Build Web Dashboard
+        shell: pwsh
         run: |
-          if [ -d "web" ] && [ -f "web/package.json" ]; then
-            cd web
+          if ((Test-Path "web") -and (Test-Path "web/package.json")) {
+            Push-Location web
+
             npm ci
             npm run build
-          fi
 
+            Pop-Location
+          }
+          else {
+            Write-Host "Web dashboard not present; skipping."
+          }
+
+      # ------------------------------------------------------------
+      # Package Release
+      # ------------------------------------------------------------
       - name: Package Release
+        shell: pwsh
         run: |
-          # Resolve tag name safely for workflow_dispatch or tag pushes
-          TAG=${GITHUB_REF#refs/tags/}
-          if [ "$TAG" = "$GITHUB_REF" ]; then
-            TAG="latest"
-          fi
+          $tag = "${env:GITHUB_REF}"
 
-          mkdir -p dist
-          
-          # Copy core engine and CUDA runtime binaries
-          cp c/qwen36.exe dist/
-          cp c/coli_cuda.dll dist/
+          if ($tag -match '^refs/tags/(.+)$') {
+            $tag = $Matches[1]
+          }
+          else {
+            $tag = "latest"
+          }
 
-          # Copy core Python tools & support files safely without failing on missing items
-          mkdir -p dist/tools
-          cp -f c/tools/*.py dist/tools/ 2>/dev/null || true
-          cp -f c/coli dist/ 2>/dev/null || true
-          cp -f c/*.py dist/ 2>/dev/null || true
-          cp -f LICENSE dist/ 2>/dev/null || true
-          
-          # Copy Web Dashboard Assets if built
-          if [ -d "web/dist" ]; then
-            mkdir -p dist/web
-            cp -r web/dist dist/web/dist
-          fi
-          
-          # Create archive
-          cd dist
-          7z a colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip *
+          $dist = Join-Path $PWD "dist"
 
+          if (Test-Path $dist) {
+            Remove-Item $dist -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          New-Item -ItemType Directory -Path "$dist\tools" | Out-Null
+
+          # Core Windows binaries
+          Copy-Item "c\colibri.exe" "$dist\"
+          Copy-Item "c\coli_cuda.dll" "$dist\"
+
+          # IO benchmark
+          Copy-Item "c\iobench.exe" "$dist\"
+
+          # Core Python tools
+          if (Test-Path "c\tools") {
+            Get-ChildItem "c\tools\*.py" -ErrorAction SilentlyContinue |
+              Copy-Item -Destination "$dist\tools\"
+          }
+
+          # Optional support files
+          if (Test-Path "c\coli") {
+            Copy-Item "c\coli" "$dist\"
+          }
+
+          Get-ChildItem "c\*.py" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination "$dist\"
+
+          if (Test-Path "LICENSE") {
+            Copy-Item "LICENSE" "$dist\"
+          }
+
+          # Web dashboard
+          if (Test-Path "web\dist") {
+            New-Item -ItemType Directory -Path "$dist\web" | Out-Null
+
+            Copy-Item `
+              "web\dist" `
+              "$dist\web\dist" `
+              -Recurse
+          }
+
+          # Create ZIP
+          $zipName = "colibri-$tag-${{ matrix.arch_name }}.zip"
+          $zipPath = Join-Path $PWD "dist\$zipName"
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          Compress-Archive `
+            -Path "$dist\*" `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal
+
+          Write-Host ""
+          Write-Host "Created:"
+          Write-Host $zipPath
+          Write-Host ""
+
+          Get-Item $zipPath | Format-List Name, Length, FullName
+
+      # ------------------------------------------------------------
+      # Verify ZIP
+      # ------------------------------------------------------------
       - name: Verify Package Contents
+        shell: pwsh
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          if [ "$TAG" = "$GITHUB_REF" ]; then
-            TAG="latest"
-          fi
+          $tag = "${env:GITHUB_REF}"
 
-          mkdir -p verify && cd verify
-          7z x ../dist/colibri-qwen36-${TAG}-${{ matrix.arch_name }}.zip > /dev/null
-          
-          test -f qwen36.exe || { echo "FAIL: qwen36.exe missing from package"; exit 1; }
-          test -f coli_cuda.dll || { echo "FAIL: coli_cuda.dll missing from package"; exit 1; }
+          if ($tag -match '^refs/tags/(.+)$') {
+            $tag = $Matches[1]
+          }
+          else {
+            $tag = "latest"
+          }
 
-      - uses: actions/upload-artifact@v4
+          $zip = "dist\colibri-$tag-${{ matrix.arch_name }}.zip"
+
+          if (-not (Test-Path $zip)) {
+            throw "FAIL: Release ZIP was not created: $zip"
+          }
+
+          $verify = Join-Path $PWD "verify"
+
+          if (Test-Path $verify) {
+            Remove-Item $verify -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $verify | Out-Null
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath $verify `
+            -Force
+
+          $required = @(
+            "colibri.exe",
+            "coli_cuda.dll",
+            "iobench.exe"
+          )
+
+          foreach ($file in $required) {
+            $path = Join-Path $verify $file
+
+            if (-not (Test-Path $path)) {
+              throw "FAIL: $file missing from package"
+            }
+
+            Write-Host "OK: $file"
+          }
+
+          Write-Host ""
+          Write-Host "Package contents:"
+          Get-ChildItem $verify -Recurse
+
+      # ------------------------------------------------------------
+      # Upload artifact
+      # ------------------------------------------------------------
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: colibri-qwen36-${{ matrix.arch_name }}
-          path: dist/colibri-qwen36-*.zip
+          name: colibri-${{ matrix.arch_name }}
+          path: dist/colibri-*.zip
+          if-no-files-found: error
 
+  # ==================================================================
+  # GitHub Release
+  # ==================================================================
   release:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # ------------------------------------------------------------
+      # Checksums
+      # ------------------------------------------------------------
+      - name: Generate SHA256SUMS
+        shell: bash
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          (cd artifacts && sha256sum colibri-qwen36-*) > artifacts/SHA256SUMS.txt
+          cd artifacts
 
-          NOTES="Release ${TAG} (Qwen 3.6 Engine)"
+          sha256sum colibri-*.zip > SHA256SUMS.txt
+
+          echo "SHA256SUMS:"
+          cat SHA256SUMS.txt
+
+      # ------------------------------------------------------------
+      # Release notes
+      # ------------------------------------------------------------
+      - name: Prepare release notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          NOTES="Release ${TAG}"
+
           if [ -f CHANGELOG.md ]; then
-            EXTRACTED=$(awk "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" CHANGELOG.md)
+            EXTRACTED=$(awk \
+              "/^## \\[${TAG#v}\\]/{found=1;next} /^## \\[/{if(found)exit} found{print}" \
+              CHANGELOG.md)
+
             if [ -n "$EXTRACTED" ]; then
               NOTES="$EXTRACTED"
             fi
           fi
 
+          {
+            echo 'notes<<EOF'
+            echo "$NOTES"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # Create / update GitHub Release
+      # ------------------------------------------------------------
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          echo "Publishing release ${TAG}"
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" artifacts/* --clobber
+            echo "Release already exists; uploading artifacts."
+
+            gh release upload \
+              "$TAG" \
+              artifacts/* \
+              --clobber
           else
-            gh release create "$TAG" artifacts/* \
-              --title "colibri ${TAG} (Qwen 3.6 Engine)" \
-              --notes "$NOTES"
+            echo "Creating new release."
+
+            gh release create \
+              "$TAG" \
+              artifacts/* \
+              --title "colibri ${TAG}" \
+              --notes "${{ steps.notes.outputs.notes }}"
           fi
