@@ -1,4 +1,3 @@
-```yaml
 name: Release
 
 on:
@@ -521,4 +520,3 @@ jobs:
               --title "colibri ${TAG} (Qwen 3.6 Engine)" \
               --notes "${{ steps.notes.outputs.notes }}"
           fi
-```
